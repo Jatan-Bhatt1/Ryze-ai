@@ -1,10 +1,6 @@
-/**
- * Agent: Planner
- * Responsibility: Convert user intent into a structured JSON plan.
- */
-
 import { complete } from '../llm.js';
 import { PLANNER_SYS_PROMPT, buildPlannerUserPrompt } from '../prompts/planner.prompt.js';
+import { plannerSchema } from '../validation/schema.js';
 
 export async function runPlanner(userPrompt, existingCode) {
   const fullUserPrompt = buildPlannerUserPrompt(userPrompt, existingCode);
@@ -25,7 +21,14 @@ export async function runPlanner(userPrompt, existingCode) {
       throw new Error('Planner failed to generate valid JSON.');
     }
 
-    return { plan, rawResponse: response };
+    // Validate with Zod
+    const validation = plannerSchema.safeParse(plan);
+    if (!validation.success) {
+      console.error('Planner JSON validation failed:', validation.error);
+      throw new Error('Planner generated invalid plan structure.');
+    }
+
+    return { plan: validation.data, rawResponse: response };
   } catch (error) {
     console.error('Planner Agent Error:', error);
     throw error;

@@ -3,6 +3,7 @@ import ChatPanel from './components/chat/ChatPanel.jsx';
 import CodeEditor from './components/editor/CodeEditor.jsx';
 import LivePreview from './components/preview/LivePreview.jsx';
 import VersionHistory from './components/VersionHistory.jsx';
+import DiffView from './components/DiffView.jsx';
 import './App.css';
 
 const API_BASE = '/api';
@@ -15,6 +16,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('preview');
   const [isMockMode, setIsMockMode] = useState(false);
+  const [compareVersion, setCompareVersion] = useState(null);
 
   // Fetch versions from server
   const fetchVersions = useCallback(async () => {
@@ -33,6 +35,14 @@ export default function App() {
     setMessages(prev => [...prev, { role: 'user', text: prompt }]);
     setIsLoading(true);
 
+    // Add initial assistant message for streaming
+    setMessages(prev => [...prev, {
+      role: 'assistant',
+      text: '', // Start empty
+      steps: { planner: null, generator: null, explainer: null }, // Initial steps state
+      isLoading: true
+    }]);
+
     try {
       const res = await fetch(`${API_BASE}/generate`, {
         method: 'POST',
@@ -43,36 +53,97 @@ export default function App() {
         }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to generate UI');
+        throw new Error(res.statusText || 'Failed to generate UI');
       }
 
-      // Add assistant message with all 3 agent steps
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        text: data.explanation,
-        steps: data.steps,
-        components: data.components,
-        isMock: data.isMock
-      }]);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      setCode(data.code);
-      setCurrentVersion(data.version);
-      setActiveTab('preview');
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      if (data.isMock) {
-        setIsMockMode(true);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop(); // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === 'step') {
+              setMessages(prev => {
+                const lastMsg = prev[prev.length - 1];
+                if (lastMsg.role !== 'assistant') return prev;
+
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...lastMsg,
+                    steps: {
+                      ...lastMsg.steps,
+                      [data.step]: data.status // 'pending', 'completed', 'streaming'
+                    }
+                  }
+                ];
+              });
+            } else if (data.type === 'explanation') {
+              setMessages(prev => {
+                const lastMsg = prev[prev.length - 1];
+                if (lastMsg.role !== 'assistant') return prev;
+
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...lastMsg,
+                    text: lastMsg.text + data.chunk
+                  }
+                ];
+              });
+            } else if (data.type === 'complete') {
+              setCode(data.code);
+              setCurrentVersion(data.version);
+              setActiveTab('preview');
+              setMessages(prev => {
+                const lastMsg = prev[prev.length - 1];
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...lastMsg,
+                    isLoading: false,
+                    text: data.explanation // Ensure full text is set
+                  }
+                ];
+              });
+              // Refresh versions
+              await fetchVersions();
+            } else if (data.type === 'error') {
+              throw new Error(data.message);
+            }
+          }
+        }
       }
 
-      // Refresh versions
-      await fetchVersions();
     } catch (err) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        text: `❌ Error: ${err.message}`,
-      }]);
+      setMessages(prev => {
+        // Remove the loading assistant message if it exists and replace with error or append error
+        const lastMsg = prev[prev.length - 1];
+        if (lastMsg.role === 'assistant' && lastMsg.isLoading) {
+          return [
+            ...prev.slice(0, -1),
+            {
+              role: 'assistant',
+              text: `❌ Error: ${err.message}`,
+            }
+          ];
+        }
+        return [...prev, {
+          role: 'assistant',
+          text: `❌ Error: ${err.message}`,
+        }];
+      });
     } finally {
       setIsLoading(false);
     }
@@ -108,12 +179,23 @@ export default function App() {
     setCode(newCode);
   }, []);
 
+  const handleCompare = useCallback((version) => {
+    setCompareVersion(version);
+  }, []);
+
+  const handleReplay = useCallback((prompt) => {
+    // Re-trigger generation with the same prompt
+    handleSend(prompt);
+  }, [handleSend]);
+
   return (
     <div className="app">
       <VersionHistory
         versions={versions}
         currentVersion={currentVersion}
         onRollback={handleRollback}
+        onCompare={handleCompare}
+        onReplay={handleReplay}
       />
       <div className="app__main">
         <div className="app__chat">
@@ -139,6 +221,13 @@ export default function App() {
           )}
         </div>
       </div>
+      {compareVersion && (
+        <DiffView
+          oldCode={compareVersion.code}
+          newCode={code}
+          onClose={() => setCompareVersion(null)}
+        />
+      )}
     </div>
   );
 }

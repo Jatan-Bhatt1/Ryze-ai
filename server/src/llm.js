@@ -22,16 +22,23 @@ export function initLLM() {
   return activeProvider;
 }
 
-export async function complete({ system, user, jsonMode = false }) {
+export async function complete({ system, user, jsonMode = false, stream = false }) {
   if (activeProvider === 'openai') {
-    const completion = await openai.chat.completions.create({
+    const params = {
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user }
       ],
       model: 'gpt-4o',
+      stream,
       response_format: jsonMode ? { type: 'json_object' } : undefined,
-    });
+    };
+
+    if (stream) {
+      return openai.chat.completions.create(params);
+    }
+
+    const completion = await openai.chat.completions.create(params);
     return completion.choices[0].message.content;
   }
 
@@ -49,6 +56,11 @@ export async function complete({ system, user, jsonMode = false }) {
         responseMimeType: jsonMode ? "application/json" : "text/plain"
       }
     });
+
+    if (stream) {
+      const result = await model.generateContentStream(user);
+      return result.stream;
+    }
 
     const result = await model.generateContent(user);
     const response = await result.response;

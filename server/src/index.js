@@ -15,11 +15,32 @@ import { sanitizeInput } from './validation/sanitizer.js';
 import versionStore from './store/versionStore.js';
 import { initLLM, getProvider } from './llm.js';
 
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+// Serve static files from the public directory (where built client resides)
+app.use(express.static('public'));
+
+// SPA Fallback: Serve index.html for any unknown routes
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    return next();
+  }
+  res.sendFile(path.join(__dirname, '../public/index.html'), (err) => {
+    if (err) {
+      res.status(404).send("Client build not found");
+    }
+  });
+});
 
 // Initialize LLM Provider (OpenAI or Gemini)
 initLLM();
@@ -37,17 +58,31 @@ app.post('/api/generate', async (req, res) => {
       return res.status(400).json({ error: 'Prompt is required' });
     }
 
+    // Enable SSE Streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); // Establish connection immediately
+
+    const sendEvent = (type, data) => {
+      res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+    };
+
     // Step 0: Sanitize input
     const { clean, flagged, reason } = sanitizeInput(prompt);
     if (flagged) {
-      return res.status(400).json({ error: reason });
+      sendEvent('error', { message: reason });
+      res.end();
+      return;
     }
 
     // MOCK MODE CHECK
     if (getProvider() === 'mock') {
       console.log('[Agent] Running in MOCK MODE');
-      const mockResult = runMockAgent(clean);
+      sendEvent('step', { step: 'planner', status: 'completed', plan: { reason: "Mock Plan" } });
+      sendEvent('step', { step: 'generator', status: 'completed', code: "// Mock Code" });
 
+      const mockResult = runMockAgent(clean);
       const version = versionStore.save({
         code: mockResult.code,
         plan: mockResult.plan,
@@ -55,35 +90,41 @@ app.post('/api/generate', async (req, res) => {
         prompt: clean
       });
 
-      return res.json({
-        ...mockResult,
+      sendEvent('explanation', { chunk: mockResult.explanation });
+      sendEvent('complete', {
         version: version.id,
-        steps: {
-          planner: mockResult.plan,
-          generator: mockResult.code,
-          explainer: mockResult.explanation
-        }
+        code: mockResult.code,
+        plan: mockResult.plan,
+        explanation: mockResult.explanation
       });
+      res.end();
+      return;
     }
 
     const isIteration = !!existingCode;
 
     // Step 1: Planner
     console.log('[Agent] Step 1: Planning...');
+    sendEvent('step', { step: 'planner', status: 'pending' });
     const { plan } = await runPlanner(clean, existingCode);
+    sendEvent('step', { step: 'planner', status: 'completed', plan });
 
     // Step 2: Generator
     console.log('[Agent] Step 2: Generating code...');
+    sendEvent('step', { step: 'generator', status: 'pending' });
     const { code } = await runGenerator(plan, existingCode);
 
     // Step 2.5: Validate
     console.log('[Agent] Validating code...');
+    sendEvent('step', { step: 'validator', status: 'pending' });
     const validation = validateCode(code);
+    let finalCode = code;
+
     if (!validation.valid) {
       console.warn('[Agent] Validation failed:', validation.errors);
-      // Try to regenerate once with validation feedback
+      sendEvent('step', { step: 'validator', status: 'failed', errors: validation.errors });
 
-      // Don't pass existing code on retry to force clean generation if needed
+      // Try to regenerate once with validation feedback
       const { code: fixedCode } = await runGenerator({
         ...plan,
         validationErrors: validation.errors,
@@ -91,57 +132,74 @@ app.post('/api/generate', async (req, res) => {
 
       const revalidation = validateCode(fixedCode);
       if (!revalidation.valid) {
-        return res.status(422).json({
-          error: 'Generated code failed validation even after retry',
-          validationErrors: revalidation.errors,
-          plan,
-        });
+        sendEvent('error', { message: 'Generated code failed validation even after retry', validationErrors: revalidation.errors });
+        res.end();
+        return;
       }
-
-      // Step 3: Explainer (with fixed code)
-      console.log('[Agent] Step 3: Explaining...');
-      const { explanation } = await runExplainer(plan, fixedCode, clean, isIteration);
-
-      const version = versionStore.save({ code: fixedCode, plan, explanation, prompt: clean });
-
-      return res.json({
-        code: fixedCode,
-        plan,
-        explanation,
-        version: version.id,
-        components: revalidation.usedComponents,
-        steps: {
-          planner: plan,
-          generator: fixedCode,
-          explainer: explanation,
-        },
-      });
+      finalCode = fixedCode;
+      sendEvent('step', { step: 'validator', status: 'repaired' });
+    } else {
+      sendEvent('step', { step: 'validator', status: 'valid' });
     }
 
-    // Step 3: Explainer
+    sendEvent('step', { step: 'generator', status: 'completed', code: finalCode });
+
+    // Step 3: Explainer (Streaming)
     console.log('[Agent] Step 3: Explaining...');
-    const { explanation } = await runExplainer(plan, code, clean, isIteration);
+    sendEvent('step', { step: 'explainer', status: 'streaming' });
+
+    const stream = await runExplainer(plan, finalCode, clean, isIteration, true);
+
+    let fullExplanation = '';
+    for await (const chunk of stream) {
+      // OpenAI chunks are objects, Gemini chunks are text (via our wrapper)
+      // Adjust based on provider wrapper implementation. 
+      // Our wrapper returns stream from OpenAI or Gemini.
+      // OpenAI stream yields 'chunk' objects. Gemini yields 'chunk' objects too but different structure.
+
+      let textChunk = '';
+      if (typeof chunk === 'string') {
+        textChunk = chunk;
+      } else if (chunk.choices) {
+        // OpenAI
+        textChunk = chunk.choices[0]?.delta?.content || '';
+      } else if (chunk.text && typeof chunk.text === 'function') {
+        // Gemini
+        textChunk = chunk.text();
+      }
+
+      if (textChunk) {
+        fullExplanation += textChunk;
+        sendEvent('explanation', { chunk: textChunk });
+      }
+    }
+
+    sendEvent('step', { step: 'explainer', status: 'completed' });
 
     // Save version
-    const version = versionStore.save({ code, plan, explanation, prompt: clean });
+    const version = versionStore.save({ code: finalCode, plan, explanation: fullExplanation, prompt: clean });
 
     console.log(`[Agent] Complete! Version ${version.id} saved.`);
 
-    res.json({
-      code,
-      plan,
-      explanation,
+    sendEvent('complete', {
       version: version.id,
-      components: validation.usedComponents,
-      steps: {
-        planner: plan,
-        generator: code,
-        explainer: explanation,
-      },
+      code: finalCode,
+      plan,
+      explanation: fullExplanation
     });
+
+    res.end();
+
   } catch (err) {
     console.error('[Agent] Error:', err.message);
-    res.status(500).json({ error: err.message });
+    // If headers already sent, we can't send status 500
+    // Try to send error event
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.write(`data: ${JSON.stringify({ type: 'error', message: err.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
